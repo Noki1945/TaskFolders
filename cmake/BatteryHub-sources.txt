@@ -1,0 +1,10 @@
+TaskFolders edition of BatteryHub 1.1.0 (GPL-3.0).
+Base commit: 7cc44f2b2c63341e2b478463c7467759837a74a9.
+Original sources and TaskFolders changes are distributed in BatteryHub/source.
+Unzip BatteryHub-1.1.0-source.zip in an empty directory, run git apply --no-index
+with the full path to taskfolders.patch, add MinGW-w64 to PATH and run build.bat 1.1.0 dev.
+Changes add a settings interface and Logitech LIGHTSPEED receiver monitoring.
+Original project: https://github.com/krisgfx9/Wireless-Device-Battery-Monitor/tree/v1.1.0
+HeadsetControl is included unmodified from the upstream portable release:
+https://github.com/krisgfx9/Wireless-Device-Battery-Monitor/releases/download/v1.1.0/headsetcontrol-4.3.0.tar.gz
+See LICENSE.txt and THIRD_PARTY_NOTICES.txt.

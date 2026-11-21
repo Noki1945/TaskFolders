@@ -1,0 +1,29 @@
+#define EDITOR 100
+#define GROUPS 101
+#define NAMEBOX 102
+#define NEWGROUP 103
+#define RENAMEGROUP 104
+#define DROPGROUP 105
+#define APPS 106
+#define ADDAPP 107
+#define DROPAPP 108
+#define SHOWLABEL 123
+#define DENSEGRID 109
+#define DEVICES 110
+
+#define FOLDER_TAB 111
+#define DEVICE_TAB 112
+#define DEVICE_TREE 113
+#define DEVICE_ACTION 114
+#define DEVICE_STATUS 115
+#define BACKGROUND 116
+#define BACKGROUND_FILE 117
+#define GROUP_LABEL 118
+#define NAME_LABEL 119
+#define APPS_LABEL 120
+#define DROP_HINT 121
+#define DEVICE_REFRESH 122
+
+#define MEDIA_TAB 124
+#define AUTOSTART 125
+#define REMOVE_ALL 126

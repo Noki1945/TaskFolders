@@ -1,0 +1,1 @@
+vendor/BatteryHub/*.patch -text whitespace=-blank-at-eol

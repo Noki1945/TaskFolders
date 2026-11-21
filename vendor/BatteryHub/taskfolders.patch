@@ -1,0 +1,320 @@
+diff --git a/src/drivers/logitech.cpp b/src/drivers/logitech.cpp
+index 72b54c6..a87701a 100644
+--- a/src/drivers/logitech.cpp
++++ b/src/drivers/logitech.cpp
+@@ -271,6 +271,7 @@ bool PollLogitechDevice(PollContext& ctx, USHORT pid, const std::vector<const Hi
+     else
+         indices = { 1, 2, 3, 4, 5, 6 };
+ 
++    if(pid==0xC54D) indices={1,2,3,4,5,6};
+     bool any = false;
+     for (BYTE idx : indices) {
+         DeviceStatus s;
+@@ -281,6 +282,8 @@ bool PollLogitechDevice(PollContext& ctx, USHORT pid, const std::vector<const Hi
+         s.kind = passthrough ? DeviceKind::Mouse : GuessKind(s.name);
+ 
+         int r = h.Request(idx, 0x00, 0x10 | kSwId, { 0, 0, 0x5A }, p, err, false, 400);
++        if(pid==0xC54D && r!=1)
++            r=h.Request(idx,0,0x10|kSwId,{0,0,0x5A},p,err,true,350);
+         bool found = false;
+         if (r == 1 && p.size() >= 3 && p[0] >= 2) {
+             ReadNameAndType20(h, idx, s);
+@@ -296,6 +299,22 @@ bool PollLogitechDevice(PollContext& ctx, USHORT pid, const std::vector<const Hi
+         } else if (r == 0 && err == 0x01) {  // "invalid sub id": a HID++ 1.0 device
+             found = ReadBattery10(h, idx, s);
+         }
++        if(pid==0xC54D) {
++            // Pairing info remains readable from the USB receiver while the radio sleeps.
++            // Register B5/40+n contains the paired device name, independent of its battery.
++            s.via=L"LIGHTSPEED 2.4 GHz";
++            if(!found && r==0 && err==0x08) {
++                BYTE slot=static_cast<BYTE>(0x40+idx-1);
++                if(h.Request(0xff,0x83,0xb5,{slot},p,err,true,220)==1 &&
++                   p.size()>=3 && p[0]==slot && p[1]>0 && p[1]<=p.size()-2) {
++                    s.name.assign(p.begin()+2,p.begin()+2+p[1]);
++                    s.kind=DeviceKind::Mouse;
++                    s.connected=false;
++                    s.graceSec=0;
++                    found=true;
++                }
++            }
++        }
+         if (found) {
+             if (s.kind == DeviceKind::Other) s.kind = GuessKind(s.name);
+             ctx.out.push_back(s);
+diff --git a/src/main.cpp b/src/main.cpp
+index 0002f4c..6f27873 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -6,6 +6,7 @@
+ #include <hidclass.h>
+ 
+ #include <algorithm>
++#include <functional>
+ #include <atomic>
+ #include <climits>
+ #include <cstdio>
+@@ -25,6 +26,7 @@
+ #include "report.h"
+ #include "rename_dialog.h"
+ #include "widget.h"
++#include "mouse_indicator.h"
+ #include "update_win.h"
+ #include "update_apply.h"
+ 
+@@ -36,7 +38,7 @@ constexpr UINT WM_WIDGET_CLICK = WM_APP + 3;
+ constexpr UINT_PTR TIMER_DEBOUNCE = 1;
+ constexpr UINT_PTR TIMER_WIDGET = 2;
+ constexpr UINT_PTR TIMER_ALERT_ICON = 3;
+-// "Check battery every" choices in seconds; 60 is the default. A poll resets an awake device's sleep timer,
++// "Check battery every" choices in seconds; 300 is the default. A poll resets an awake device's sleep timer,
+ // so a device only sleeps if its timer is shorter than the interval.
+ constexpr DWORD POLL_SECONDS[] = { 30, 60, 120, 300, 600, 900, 1800, 3600 };
+ constexpr int LOW_BATTERY = 15;
+@@ -77,7 +79,7 @@ std::wstring g_widgetMonitor = L"all";  // which taskbars show the widget: "all"
+ bool g_widgetBackground = false;  // draw a plate behind the taskbar text (transparent taskbar themes)
+ bool g_stacked = false;      // icon above the percentage (menu option)
+ bool g_brandColors = false;  // off by default; known brands get their color (Razer green, Logitech blue, ...)
+-std::atomic<DWORD> g_pollIntervalMs{ 60 * 1000 };  // set from the menu, read by the worker thread
++std::atomic<DWORD> g_pollIntervalMs{ 300 * 1000 };  // set from the menu, read by the worker thread
+ 
+ struct TrayEntry {
+     UINT uid = 0;
+@@ -285,7 +287,7 @@ void SaveStacked(bool on) { SaveBoolSetting(L"StackedLayout", on); }
+ bool LoadBrandColors() { return LoadBoolSetting(L"BrandColors", false); }
+ void SaveBrandColors(bool on) { SaveBoolSetting(L"BrandColors", on); }
+ DWORD LoadPollSeconds() {
+-    DWORD v = 60, sz = sizeof(v);
++    DWORD v = 300, sz = sizeof(v);
+     RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"PollIntervalSeconds", RRF_RT_REG_DWORD, nullptr, &v, &sz);
+     return std::clamp<DWORD>(v, 30, 24 * 60 * 60);
+ }
+@@ -414,7 +416,7 @@ Rgb Foreground() { return g_lightTaskbar ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 }
+ 
+ Accent AccentFor(const DeviceStatus& s) { return g_brandColors ? BrandOf(s) : Accent::None; }
+ 
+-HICON IconFor(int pct, bool charging, bool dim, Accent accent) {
++HICON IconFor(int pct, bool charging, bool dim, Accent accent, DeviceKind kind) {
+     Rgb fg = Foreground();
+     BrandColor bc = AccentColor(accent, g_lightTaskbar);
+     Rgb bar = charging        ? Rgb{ 0, 170, 255 }
+@@ -423,6 +425,11 @@ HICON IconFor(int pct, bool charging, bool dim, Accent accent) {
+             : accent != Accent::None ? Rgb{ bc.r, bc.g, bc.b }
+                               : Rgb{ 30, 190, 90 };
+     Rgb text = (!charging && pct >= 0 && pct <= LOW_BATTERY) ? Rgb{ 240, 50, 60 } : fg;
++    if(kind==DeviceKind::Mouse && !dim) {
++        auto level=mouse_indicator::band(pct);
++        text=mouse_indicator::color(level,fg,g_lightTaskbar);
++        bar=mouse_indicator::color(level,bar,g_lightTaskbar);
++    }
+     std::wstring t = pct < 0 ? L"?" : std::to_wstring(pct);
+     return RenderIcon(t, pct, text, bar, dim);
+ }
+@@ -529,7 +536,7 @@ void ApplyEntry(TrayEntry& e) {
+                        L"a" + std::to_wstring((int)accent) + (s.connected ? L"|on" : L"|off");
+     if (sig != e.iconSig || !e.icon) {
+         if (e.icon) DestroyIcon(e.icon);
+-        e.icon = s.connected ? IconFor(shown, charging, dim, accent)
++        e.icon = s.connected ? IconFor(shown, charging, dim, accent, s.kind)
+                              : RenderIcon(L"\u00D7", -1, Foreground(), Foreground(), true);
+         e.iconSig = sig;
+     }
+@@ -806,7 +813,32 @@ void MoveEntry(const std::wstring& key, int dir) {
+     UpdateWidget();
+ }
+ 
+-void ShowMenu() {
++// TaskFolders integration, maintained separately from upstream.
++const UINT settingsRequest=RegisterWindowMessageW(L"TaskFolders.BatterySettings.1");
++const UINT settingsAction=RegisterWindowMessageW(L"TaskFolders.BatteryAction.1");
++constexpr ULONG_PTR settingsPayload=0x54464231;
++HWND settingsClient{};
++std::function<void(UINT)> applySettings;
++std::set<UINT> enabledSettings;
++void menuRows(HMENU menu,unsigned depth,std::wstring& text) {
++    int count=GetMenuItemCount(menu);
++    for(int i=0;i<count;++i) {
++        wchar_t label[1024]{};
++        MENUITEMINFOW item{sizeof(item)};
++        item.fMask=MIIM_FTYPE|MIIM_ID|MIIM_SUBMENU|MIIM_STATE|MIIM_STRING;
++        item.dwTypeData=label; item.cch=1023;
++        if(!GetMenuItemInfoW(menu,i,TRUE,&item) || (item.fType&MFT_SEPARATOR)) continue;
++        UINT id=item.hSubMenu || (item.fState&MFS_DISABLED) ? 0 : item.wID;
++        if(id) enabledSettings.insert(id);
++        std::wstring caption(label);
++        for(auto& ch:caption) if(ch==L'\n'||ch==L'\r'||ch==L'\t') ch=L' ';
++        text+=std::to_wstring(depth)+L"\t"+std::to_wstring(id)+L"\t";
++        if(item.fState&MFS_CHECKED) text+=L"✓ ";
++        text+=caption+L"\n";
++        if(item.hSubMenu) menuRows(item.hSubMenu,depth+1,text);
++    }
++}
++void ShowMenu(HWND client=nullptr) {
+     ApplyMenuTheme(g_lightTaskbar);
+     HMENU m = CreatePopupMenu();
+     std::vector<std::wstring> keys;  // device index -> device key; menu id ID_DEVICE_FIRST + index * DEV_STRIDE + command
+@@ -924,13 +956,7 @@ void ShowMenu() {
+     AppendMenuW(m, updateFlags, ID_AUTO_UPDATE, T(L"Automatically check for updates"));
+     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+     AppendMenuW(m, MF_STRING, ID_EXIT, T(L"Exit"));
+-    POINT pt;
+-    GetCursorPos(&pt);
+-    SetForegroundWindow(g_hwnd);
+-    UINT cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | (i18n::Rtl() ? TPM_LAYOUTRTL : 0), pt.x, pt.y, 0,
+-                              g_hwnd, nullptr);
+-    PostMessageW(g_hwnd, WM_NULL, 0, 0);
+-    DestroyMenu(m);
++    auto apply=[keys,languages,monitors](UINT cmd) {
+     switch (cmd) {
+         case ID_REFRESH: SetEvent(g_refreshEvt); break;
+         case ID_AUTOSTART: SetAutostart(!AutostartEnabled()); break;
+@@ -983,6 +1009,26 @@ void ShowMenu() {
+                 }
+             }
+     }
++    };
++    if(client) {
++        settingsClient=client;
++        applySettings=std::move(apply);
++        enabledSettings.clear();
++        std::wstring text;
++        menuRows(m,0,text);
++        DestroyMenu(m);
++        COPYDATASTRUCT data{settingsPayload,static_cast<DWORD>((text.size()+1)*sizeof(wchar_t)),text.data()};
++        SendMessageTimeoutW(client,WM_COPYDATA,(WPARAM)g_hwnd,(LPARAM)&data,SMTO_ABORTIFHUNG,500,nullptr);
++        return;
++    }
++    POINT pt;
++    GetCursorPos(&pt);
++    SetForegroundWindow(g_hwnd);
++    UINT cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | (i18n::Rtl() ? TPM_LAYOUTRTL : 0), pt.x, pt.y, 0,
++                              g_hwnd, nullptr);
++    PostMessageW(g_hwnd, WM_NULL, 0, 0);
++    DestroyMenu(m);
++    apply(cmd);
+ }
+ 
+ // ---- worker thread ----------------------------------------------------------------------------
+@@ -1046,6 +1092,20 @@ DWORD WINAPI Worker(LPVOID) {
+ void RefreshSoon(UINT ms) { SetTimer(g_hwnd, TIMER_DEBOUNCE, ms, nullptr); }
+ 
+ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
++    if(msg==settingsRequest) {
++        HWND client=reinterpret_cast<HWND>(wp);
++        if(IsWindow(client)) ShowMenu(client);
++        return 0;
++    }
++    if(msg==settingsAction) {
++        if(reinterpret_cast<HWND>(wp)==settingsClient && IsWindow(settingsClient) &&
++           enabledSettings.count(static_cast<UINT>(lp)) && applySettings) {
++            auto run=applySettings;
++            run(static_cast<UINT>(lp));
++            if(IsWindow(h) && IsWindow(settingsClient)) ShowMenu(settingsClient);
++        }
++        return 0;
++    }
+     if (msg == g_taskbarCreatedMsg && msg != 0) {  // Explorer restarted
+         widget::Destroy();
+         g_useWidget = false;
+@@ -1056,9 +1116,24 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+         return 0;
+     }
+     switch (msg) {
++        case WM_INPUT: {
++            // Vendor HID++ short reports only. A 0x41 link-up wakes the battery poller.
++            alignas(RAWINPUT) BYTE bytes[512];
++            UINT size=sizeof(bytes);
++            if(GetRawInputData((HRAWINPUT)lp,RID_INPUT,bytes,&size,sizeof(RAWINPUTHEADER))!=UINT(-1)) {
++                auto* event=reinterpret_cast<RAWINPUT*>(bytes);
++                if(event->header.dwType==RIM_TYPEHID && event->data.hid.dwSizeHid>=7 &&
++                   event->data.hid.dwCount && size>=offsetof(RAWINPUT,data.hid.bRawData)+7) {
++                    auto* report=event->data.hid.bRawData;
++                    if(report[0]==0x10 && report[2]==0x41 && !(report[4]&0x40)) RefreshSoon(300);
++                }
++            }
++            return DefWindowProcW(h,msg,wp,lp);
++        }
+         case WM_RESULTS: {
+             auto* v = reinterpret_cast<std::vector<DeviceStatus>*>(lp);
+             OnResults(*v);
++            if(IsWindow(settingsClient) && IsWindowVisible(settingsClient)) ShowMenu(settingsClient);
+             delete v;
+             return 0;
+         }
+@@ -1070,7 +1145,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+             }
+             return 0;
+         case WM_WIDGET_CLICK:
+-            ShowMenu();
++            if(HWND folders=FindWindowW(L"TaskFolders.Surface",L"TaskFolders.Controller")) {
++                DWORD pid{}; GetWindowThreadProcessId(folders,&pid); AllowSetForegroundWindow(pid);
++                PostMessageW(folders,RegisterWindowMessageW(L"TaskFolders.OpenDevices.1"),0,0);
++            } else ShowMenu();
+             return 0;
+         case WM_ENDSESSION:  // sign-out / shutdown / installer restart manager
+             if (wp) DestroyWindow(h);
+@@ -1254,6 +1332,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
+     // A hidden top-level window (not message-only) so it receives the TaskbarCreated broadcast.
+     g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, kAppName, WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, inst, nullptr);
+     if (!g_hwnd) return 1;
++    RAWINPUTDEVICE radioEvents{0xff00,1,RIDEV_INPUTSINK,g_hwnd};
++    RegisterRawInputDevices(&radioEvents,1,sizeof(radioEvents));
+ 
+     DEV_BROADCAST_DEVICEINTERFACE_W filter{ sizeof(filter) };
+     filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+diff --git a/src/mouse_indicator.h b/src/mouse_indicator.h
+new file mode 100644
+index 0000000..a73820f
+--- /dev/null
++++ b/src/mouse_indicator.h
+@@ -0,0 +1,16 @@
++#pragma once
++namespace mouse_indicator {
++enum class Band { normal, yellow, red };
++constexpr Band band(int pct) {
++    if(pct<0 || pct>=20) return Band::normal;
++    return pct<5 ? Band::red : Band::yellow;
++}
++static_assert(band(-1)==Band::normal && band(0)==Band::red && band(4)==Band::red &&
++              band(5)==Band::yellow && band(19)==Band::yellow && band(20)==Band::normal);
++template<class Color>
++Color color(Band level, Color normal, bool light) {
++    if(level==Band::red) return light ? Color{198,24,43} : Color{255,70,80};
++    if(level==Band::yellow) return light ? Color{166,125,0} : Color{255,211,48};
++    return normal;
++}
++}
+diff --git a/src/widget.cpp b/src/widget.cpp
+index b956c4d..e8964cb 100644
+--- a/src/widget.cpp
++++ b/src/widget.cpp
+@@ -1,4 +1,5 @@
+ #include "widget.h"
++#include "mouse_indicator.h"
+ 
+ #include "i18n.h"
+ 
+@@ -421,8 +422,12 @@ std::vector<Piece> Layout(int barW, int barH, int& width, int& height) {
+         bool branded = it.accent != Accent::None;
+         BrandColor bc = AccentColor(it.accent, g_light);
+         Rgb accent{ bc.r, bc.g, bc.b };
+-        Piece icon{ RenderMask(std::wstring(1, Glyph(it.kind, it.bluetooth)), icons, g_light), branded ? accent : fg, a, Px(5) };
+-        if (branded && !it.dim) {
++        auto level=it.kind==DeviceKind::Mouse && !it.dim ? mouse_indicator::band(it.percent) : mouse_indicator::Band::normal;
++        bool warning=level!=mouse_indicator::Band::normal;
++        Rgb iconColor=it.kind==DeviceKind::Mouse ? mouse_indicator::color(level,Rgb{0,0,0},g_light) : (branded?accent:fg);
++        if(it.kind==DeviceKind::Mouse) tc=mouse_indicator::color(level,fg,g_light);
++        Piece icon{ RenderMask(std::wstring(1, Glyph(it.kind, it.bluetooth)), icons, g_light), iconColor, it.kind==DeviceKind::Mouse?255:a, Px(5) };
++        if ((branded || warning) && !it.dim) {
+             icon.haloR = Px(3);
+             icon.halo = Halo(icon.m, icon.haloR);
+             icon.haloAlpha = g_light ? 60 : 140;
+@@ -432,7 +437,7 @@ std::vector<Piece> Layout(int barW, int barH, int& width, int& height) {
+         Piece label{ RenderMask(t, text, g_light), tc, a, mark ? Px(2) : 0 };
+         if (branded && it.percent >= 0) {
+             label.barPct = it.percent;
+-            label.barColor = it.low ? red : accent;
++            label.barColor = it.kind==DeviceKind::Mouse ? iconColor : (it.low ? red : accent);
+         }
+         out.push_back(std::move(label));
+         if (mark) out.push_back({ RenderMask(std::wstring(1, it.full ? kCheck : kBolt), bolt, g_light), it.full ? full : charge, a, 0 });
